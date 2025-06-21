@@ -3,23 +3,29 @@ import threading
 import time
 
 # Hàm gửi gói tin
-def send_packet(server_ip, server_port, packet, packet_count, thread_id, stop_event):
+def send_packet(server_ip, server_port, packet, packet_count, thread_id, stop_event, max_retries=3):
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(10)  # Timeout để tránh treo kết nối
-            s.connect((server_ip, server_port))
-            for i in range(packet_count):
-                if stop_event.is_set():  # Kiểm tra nếu sự kiện dừng được kích hoạt
-                    print(f"[Thread-{thread_id}] Đã dừng do yêu cầu.")
-                    return
-                s.sendall(packet)
-            print(f"[Thread-{thread_id}] Đã gửi thành công {packet_count} gói tin.")
-    except socket.timeout:
-        print(f"[Thread-{thread_id}] Kết nối bị timeout.")
-    except ConnectionError:
-        print(f"[Thread-{thread_id}] Lỗi kết nối tới server.")
+        retries = 0
+        while retries < max_retries:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(10)  # Timeout để tránh treo kết nối
+                    s.connect((server_ip, server_port))
+                    for i in range(packet_count):
+                        if stop_event.is_set():  # Kiểm tra nếu sự kiện dừng được kích hoạt
+                            print(f"[Thread-{thread_id}] Đã dừng do yêu cầu.")
+                            return
+                        s.sendall(packet)
+                    print(f"[Thread-{thread_id}] Đã gửi thành công {packet_count} gói tin.")
+                break  # Nếu thành công, thoát vòng lặp retry
+            except (socket.timeout, ConnectionError) as e:
+                retries += 1
+                print(f"[Thread-{thread_id}] Thử lại lần {retries}/{max_retries} do lỗi: {e}")
+                time.sleep(1)  # Đợi trước khi thử lại
+        else:
+            print(f"[Thread-{thread_id}] Thất bại sau {max_retries} lần thử.")
     except Exception as e:
-        print(f"[Thread-{thread_id}] Gặp lỗi: {e}")  # Ghi lại lỗi để kiểm tra
+        print(f"[Thread-{thread_id}] Gặp lỗi không xác định: {e}")  # Ghi lại lỗi để kiểm tra
 
 # Hàm hủy luồng sau timeout
 def stop_thread_after_timeout(stop_event, timeout=5):
@@ -36,8 +42,12 @@ except ValueError:
     print("Địa chỉ server không hợp lệ. Vui lòng nhập lại!")
     exit()
 
-# Tạo gói tin spam 1MB
-packet = b"\x00" * (1024 * 1024)  # Một gói tin 1MB
+# Cho phép người dùng nhập nội dung gói tin
+packet_input = input("Nhập nội dung gói tin (để trống để sử dụng gói tin mặc định 1MB): ").strip()
+if packet_input:
+    packet = packet_input.encode('utf-8')  # Chuyển nội dung gói tin sang byte
+else:
+    packet = b"\x00" * (1024 * 1024)  # Một gói tin mặc định 1MB
 
 # Mỗi luồng gửi 10 gói tin
 packet_count = 10
